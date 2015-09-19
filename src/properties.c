@@ -69,6 +69,9 @@ Atom prop_speed = 0;
 Atom prop_edgemotion_pressure = 0;
 Atom prop_edgemotion_speed = 0;
 Atom prop_edgemotion_always = 0;
+Atom prop_buttonscroll = 0;
+Atom prop_buttonscroll_repeat = 0;
+Atom prop_buttonscroll_time = 0;
 Atom prop_off = 0;
 Atom prop_lockdrags = 0;
 Atom prop_lockdrags_time = 0;
@@ -89,6 +92,7 @@ Atom prop_capabilities = 0;
 Atom prop_resolution = 0;
 Atom prop_area = 0;
 Atom prop_softbutton_areas = 0;
+Atom prop_secondary_softbutton_areas = 0;
 Atom prop_noise_cancellation = 0;
 Atom prop_product_id = 0;
 Atom prop_device_node = 0;
@@ -162,16 +166,33 @@ InitSoftButtonProperty(InputInfoPtr pInfo)
     SynapticsParameters *para = &priv->synpara;
     int values[8];
 
-    values[0] = para->softbutton_areas[0][0];
-    values[1] = para->softbutton_areas[0][1];
-    values[2] = para->softbutton_areas[0][2];
-    values[3] = para->softbutton_areas[0][3];
-    values[4] = para->softbutton_areas[1][0];
-    values[5] = para->softbutton_areas[1][1];
-    values[6] = para->softbutton_areas[1][2];
-    values[7] = para->softbutton_areas[1][3];
+    values[0] = para->softbutton_areas[BOTTOM_RIGHT_BUTTON_AREA][LEFT];
+    values[1] = para->softbutton_areas[BOTTOM_RIGHT_BUTTON_AREA][RIGHT];
+    values[2] = para->softbutton_areas[BOTTOM_RIGHT_BUTTON_AREA][TOP];
+    values[3] = para->softbutton_areas[BOTTOM_RIGHT_BUTTON_AREA][BOTTOM];
+    values[4] = para->softbutton_areas[BOTTOM_MIDDLE_BUTTON_AREA][LEFT];
+    values[5] = para->softbutton_areas[BOTTOM_MIDDLE_BUTTON_AREA][RIGHT];
+    values[6] = para->softbutton_areas[BOTTOM_MIDDLE_BUTTON_AREA][TOP];
+    values[7] = para->softbutton_areas[BOTTOM_MIDDLE_BUTTON_AREA][BOTTOM];
     prop_softbutton_areas =
         InitAtom(pInfo->dev, SYNAPTICS_PROP_SOFTBUTTON_AREAS, 32, 8, values);
+
+    if (!para->has_secondary_buttons)
+        return;
+
+    values[0] = para->softbutton_areas[TOP_RIGHT_BUTTON_AREA][LEFT];
+    values[1] = para->softbutton_areas[TOP_RIGHT_BUTTON_AREA][RIGHT];
+    values[2] = para->softbutton_areas[TOP_RIGHT_BUTTON_AREA][TOP];
+    values[3] = para->softbutton_areas[TOP_RIGHT_BUTTON_AREA][BOTTOM];
+    values[4] = para->softbutton_areas[TOP_MIDDLE_BUTTON_AREA][LEFT];
+    values[5] = para->softbutton_areas[TOP_MIDDLE_BUTTON_AREA][RIGHT];
+    values[6] = para->softbutton_areas[TOP_MIDDLE_BUTTON_AREA][TOP];
+    values[7] = para->softbutton_areas[TOP_MIDDLE_BUTTON_AREA][BOTTOM];
+
+    if (values[0] || values[1] || values[2] || values[4] ||
+        values[5] || values[6] || values[7])
+        prop_secondary_softbutton_areas =
+            InitAtom(pInfo->dev, SYNAPTICS_PROP_SECONDARY_SOFTBUTTON_AREAS, 32, 8, values);
 }
 
 void
@@ -248,6 +269,22 @@ InitDeviceProperties(InputInfoPtr pInfo)
     fvalues[3] = 0;
     prop_speed = InitFloatAtom(pInfo->dev, SYNAPTICS_PROP_SPEED, 4, fvalues);
 
+    if (priv->has_scrollbuttons) {
+        values[0] = para->updown_button_scrolling;
+        values[1] = para->leftright_button_scrolling;
+        prop_buttonscroll =
+            InitAtom(pInfo->dev, SYNAPTICS_PROP_BUTTONSCROLLING, 8, 2, values);
+
+        values[0] = para->updown_button_repeat;
+        values[1] = para->leftright_button_repeat;
+        prop_buttonscroll_repeat =
+            InitAtom(pInfo->dev, SYNAPTICS_PROP_BUTTONSCROLLING_REPEAT, 8, 2,
+                     values);
+        prop_buttonscroll_time =
+            InitAtom(pInfo->dev, SYNAPTICS_PROP_BUTTONSCROLLING_TIME, 32, 1,
+                     &para->scroll_button_repeat);
+    }
+
     prop_off =
         InitAtom(pInfo->dev, SYNAPTICS_PROP_OFF, 8, 1, &para->touchpad_off);
     prop_lockdrags =
@@ -277,6 +314,9 @@ InitDeviceProperties(InputInfoPtr pInfo)
     prop_circscroll_trigger =
         InitAtom(pInfo->dev, SYNAPTICS_PROP_CIRCULAR_SCROLLING_TRIGGER, 8, 1,
                  &para->circular_trigger);
+    prop_circpad =
+        InitAtom(pInfo->dev, SYNAPTICS_PROP_CIRCULAR_PAD, 8, 1,
+                 &para->circular_pad);
     prop_palm =
         InitAtom(pInfo->dev, SYNAPTICS_PROP_PALM_DETECT, 8, 1,
                  &para->palm_detect);
@@ -519,6 +559,43 @@ SetProperty(DeviceIntPtr dev, Atom property, XIPropertyValuePtr prop,
         para->max_speed = speed[1];
         para->accl = speed[2];
     }
+    else if (property == prop_buttonscroll) {
+        BOOL *scroll;
+
+        if (!priv->has_scrollbuttons)
+            return BadMatch;
+
+        if (prop->size != 2 || prop->format != 8 || prop->type != XA_INTEGER)
+            return BadMatch;
+
+        scroll = (BOOL *) prop->data;
+        para->updown_button_scrolling = scroll[0];
+        para->leftright_button_scrolling = scroll[1];
+
+    }
+    else if (property == prop_buttonscroll_repeat) {
+        BOOL *repeat;
+
+        if (!priv->has_scrollbuttons)
+            return BadMatch;
+
+        if (prop->size != 2 || prop->format != 8 || prop->type != XA_INTEGER)
+            return BadMatch;
+
+        repeat = (BOOL *) prop->data;
+        para->updown_button_repeat = repeat[0];
+        para->leftright_button_repeat = repeat[1];
+    }
+    else if (property == prop_buttonscroll_time) {
+        if (!priv->has_scrollbuttons)
+            return BadMatch;
+
+        if (prop->size != 1 || prop->format != 32 || prop->type != XA_INTEGER)
+            return BadMatch;
+
+        para->scroll_button_repeat = *(INT32 *) prop->data;
+
+    }
     else if (property == prop_off) {
         CARD8 off;
 
@@ -610,6 +687,12 @@ SetProperty(DeviceIntPtr dev, Atom property, XIPropertyValuePtr prop,
 
         para->circular_trigger = trigger;
 
+    }
+    else if (property == prop_circpad) {
+        if (prop->size != 1 || prop->format != 8 || prop->type != XA_INTEGER)
+            return BadMatch;
+
+        para->circular_pad = *(BOOL *) prop->data;
     }
     else if (property == prop_palm) {
         if (prop->size != 1 || prop->format != 8 || prop->type != XA_INTEGER)
@@ -704,8 +787,21 @@ SetProperty(DeviceIntPtr dev, Atom property, XIPropertyValuePtr prop,
         if (!SynapticsIsSoftButtonAreasValid(areas))
             return BadValue;
 
-        memcpy(para->softbutton_areas[0], areas, 4 * sizeof(int));
-        memcpy(para->softbutton_areas[1], areas + 4, 4 * sizeof(int));
+        memcpy(para->softbutton_areas[BOTTOM_RIGHT_BUTTON_AREA], areas, 4 * sizeof(int));
+        memcpy(para->softbutton_areas[BOTTOM_MIDDLE_BUTTON_AREA], areas + 4, 4 * sizeof(int));
+    }
+    else if (property == prop_secondary_softbutton_areas) {
+        int *areas;
+
+        if (prop->size != 8 || prop->format != 32 || prop->type != XA_INTEGER)
+            return BadMatch;
+
+        areas = (int *) prop->data;
+        if (!SynapticsIsSoftButtonAreasValid(areas))
+            return BadValue;
+
+        memcpy(para->softbutton_areas[TOP_RIGHT_BUTTON_AREA], areas, 4 * sizeof(int));
+        memcpy(para->softbutton_areas[TOP_MIDDLE_BUTTON_AREA], areas + 4, 4 * sizeof(int));
     }
     else if (property == prop_noise_cancellation) {
         INT32 *hyst;

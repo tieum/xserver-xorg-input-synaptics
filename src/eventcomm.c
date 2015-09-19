@@ -39,11 +39,11 @@
 #include <dirent.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #include "synproto.h"
 #include "synaptics.h"
 #include "synapticsstr.h"
 #include <xf86.h>
-#include <mtdev-plumbing.h>
 #include <libevdev/libevdev.h>
 
 #ifndef INPUT_PROP_BUTTONPAD
@@ -51,6 +51,12 @@
 #endif
 #ifndef INPUT_PROP_SEMI_MT
 #define INPUT_PROP_SEMI_MT 0x03
+#endif
+#ifndef INPUT_PROP_TOPBUTTONPAD
+#define INPUT_PROP_TOPBUTTONPAD 0x04
+#endif
+#ifndef ABS_MT_TOOL_Y
+#define ABS_MT_TOOL_Y 0x3d
 #endif
 
 #define SYSCALL(call) while (((call) == -1) && (errno == EINTR))
@@ -60,6 +66,10 @@
 #define OFF(x)   ((x) % LONG_BITS)
 #define LONG(x)  ((x) / LONG_BITS)
 #define TEST_BIT(bit, array) ((array[LONG(bit)] >> OFF(bit)) & 1)
+
+#define ABS_MT_MIN ABS_MT_SLOT
+#define ABS_MT_MAX ABS_MT_TOOL_Y
+#define ABS_MT_CNT (ABS_MT_MAX - ABS_MT_MIN + 1)
 
 /**
  * Protocol-specific data.
@@ -73,21 +83,56 @@ struct eventcomm_proto_data {
     BOOL need_grab;
     int st_to_mt_offset[2];
     double st_to_mt_scale[2];
-    struct mtdev *mtdev;
-    int axis_map[MT_ABS_SIZE];
+    int axis_map[ABS_MT_CNT];
     int cur_slot;
     ValuatorMask **last_mt_vals;
     int num_touches;
 
     struct libevdev *evdev;
     enum libevdev_read_flag read_flag;
+
+    int have_monotonic_clock;
 };
+
+static void
+libevdev_log_func(enum libevdev_log_priority priority,
+                  void *data,
+                  const char *file, int line, const char *func,
+                  const char *format, va_list args)
+_X_ATTRIBUTE_PRINTF(6, 0);
+
+static void
+libevdev_log_func(enum libevdev_log_priority priority,
+                  void *data,
+                  const char *file, int line, const char *func,
+                  const char *format, va_list args)
+{
+    int verbosity;
+
+    switch(priority) {
+        case LIBEVDEV_LOG_ERROR: verbosity = 0; break;
+        case LIBEVDEV_LOG_INFO: verbosity = 4; break;
+        case LIBEVDEV_LOG_DEBUG: verbosity = 10; break;
+    }
+
+    LogVMessageVerbSigSafe(X_NOTICE, verbosity, format, args);
+}
+
+static void
+set_libevdev_log_handler(void)
+{
+                              /* be quiet, gcc *handwave* */
+    libevdev_set_log_function((libevdev_log_func_t)libevdev_log_func, NULL);
+    libevdev_set_log_priority(LIBEVDEV_LOG_DEBUG);
+}
 
 struct eventcomm_proto_data *
 EventProtoDataAlloc(int fd)
 {
     struct eventcomm_proto_data *proto_data;
     int rc;
+
+    set_libevdev_log_handler();
 
     proto_data = calloc(1, sizeof(struct eventcomm_proto_data));
     if (!proto_data)
@@ -104,16 +149,6 @@ EventProtoDataAlloc(int fd)
         proto_data->read_flag = LIBEVDEV_READ_FLAG_NORMAL;
 
     return proto_data;
-}
-
-static int
-last_mt_vals_slot(const SynapticsPrivate * priv)
-{
-    struct eventcomm_proto_data *proto_data =
-        (struct eventcomm_proto_data *) priv->proto_data;
-    int value = proto_data->cur_slot - proto_data->mtdev->caps.slot.minimum;
-
-    return value < priv->num_slots ? value : -1;
 }
 
 static void
@@ -135,8 +170,6 @@ UninitializeTouch(InputInfoPtr pInfo)
         proto_data->last_mt_vals = NULL;
     }
 
-    mtdev_close_delete(proto_data->mtdev);
-    proto_data->mtdev = NULL;
     proto_data->num_touches = 0;
 }
 
@@ -151,14 +184,7 @@ InitializeTouch(InputInfoPtr pInfo)
     if (!priv->has_touch)
         return;
 
-    proto_data->mtdev = mtdev_new_open(pInfo->fd);
-    if (!proto_data->mtdev) {
-        xf86IDrvMsg(pInfo, X_WARNING,
-                    "failed to create mtdev instance, ignoring touch events\n");
-        return;
-    }
-
-    proto_data->cur_slot = proto_data->mtdev->caps.slot.value;
+    proto_data->cur_slot = libevdev_get_current_slot(proto_data->evdev);
     proto_data->num_touches = 0;
 
     proto_data->last_mt_vals = calloc(priv->num_slots, sizeof(ValuatorMask *));
@@ -195,20 +221,9 @@ EventDeviceOnHook(InputInfoPtr pInfo, SynapticsParameters * para)
     SynapticsPrivate *priv = (SynapticsPrivate *) pInfo->private;
     struct eventcomm_proto_data *proto_data =
         (struct eventcomm_proto_data *) priv->proto_data;
+    int ret;
 
-    if (para->grab_event_device) {
-        /* Try to grab the event device so that data don't leak to /dev/input/mice */
-        int ret;
-
-        ret = libevdev_grab(proto_data->evdev, LIBEVDEV_GRAB);
-        if (ret < 0) {
-            xf86IDrvMsg(pInfo, X_WARNING, "can't grab event device, errno=%d\n",
-                        -ret);
-            return FALSE;
-        }
-    }
-
-    proto_data->need_grab = FALSE;
+    set_libevdev_log_handler();
 
     if (libevdev_get_fd(proto_data->evdev) != -1) {
         struct input_event ev;
@@ -226,6 +241,22 @@ EventDeviceOnHook(InputInfoPtr pInfo, SynapticsParameters * para)
         libevdev_set_fd(proto_data->evdev, pInfo->fd);
 
 
+    if (para->grab_event_device) {
+        /* Try to grab the event device so that data don't leak to /dev/input/mice */
+
+        ret = libevdev_grab(proto_data->evdev, LIBEVDEV_GRAB);
+        if (ret < 0) {
+            xf86IDrvMsg(pInfo, X_WARNING, "can't grab event device, errno=%d\n",
+                        -ret);
+            return FALSE;
+        }
+    }
+
+    proto_data->need_grab = FALSE;
+
+    ret = libevdev_set_clock_id(proto_data->evdev, CLOCK_MONOTONIC);
+    proto_data->have_monotonic_clock = (ret == 0);
+
     InitializeTouch(pInfo);
 
     return TRUE;
@@ -239,6 +270,8 @@ EventDeviceOffHook(InputInfoPtr pInfo)
 
     UninitializeTouch(pInfo);
     libevdev_grab(proto_data->evdev, LIBEVDEV_UNGRAB);
+    libevdev_set_log_function(NULL, NULL);
+    libevdev_set_log_priority(LIBEVDEV_LOG_INFO); /* reset to default */
 
     return Success;
 }
@@ -288,6 +321,15 @@ event_query_is_touchpad(struct libevdev *evdev, BOOL test_grab)
         libevdev_has_event_code(evdev, EV_ABS, BTN_TOOL_PEN)) /* Don't match wacom tablets */
         goto unwind;
 
+    if (libevdev_has_event_code(evdev, EV_ABS, ABS_MT_SLOT)) {
+        if (libevdev_get_num_slots(evdev) == -1)
+            goto unwind; /* Ignore fake MT devices */
+
+        if (!libevdev_has_event_code(evdev, EV_ABS, ABS_MT_POSITION_X) ||
+            !libevdev_has_event_code(evdev, EV_ABS, ABS_MT_POSITION_Y))
+            goto unwind;
+    }
+
     ret = TRUE;
 
  unwind:
@@ -311,7 +353,9 @@ static struct model_lookup_t model_lookup_table[] = {
     {0x0002, 0x0007, 0x0007, MODEL_SYNAPTICS},
     {0x0002, 0x0008, 0x0008, MODEL_ALPS},
     {0x05ac, PRODUCT_ANY, 0x222, MODEL_APPLETOUCH},
-    {0x05ac, 0x223, PRODUCT_ANY, MODEL_UNIBODY_MACBOOK},
+    {0x05ac, 0x223, 0x228, MODEL_UNIBODY_MACBOOK},
+    {0x05ac, 0x229, 0x22b, MODEL_APPLETOUCH},
+    {0x05ac, 0x22c, PRODUCT_ANY, MODEL_UNIBODY_MACBOOK},
     {0x0002, 0x000e, 0x000e, MODEL_ELANTECH},
     {0x0, 0x0, 0x0, 0x0}
 };
@@ -403,6 +447,11 @@ event_query_axis_ranges(InputInfoPtr pInfo)
     event_get_abs(proto_data->evdev, ABS_Y, &priv->miny, &priv->maxy,
                   &priv->synpara.hyst_y, &priv->resy);
 
+    if (priv->minx == priv->maxx || priv->miny == priv->maxy) {
+        xf86IDrvMsg(pInfo, X_ERROR, "Kernel bug: min == max on ABS_X/Y\n");
+        return;
+    }
+
     priv->has_pressure = libevdev_has_event_code(proto_data->evdev, EV_ABS, ABS_PRESSURE);
     priv->has_width = libevdev_has_event_code(proto_data->evdev, EV_ABS, ABS_TOOL_WIDTH);
 
@@ -424,6 +473,11 @@ event_query_axis_ranges(InputInfoPtr pInfo)
                       &priv->maxx, &priv->synpara.hyst_x, &priv->resx);
         event_get_abs(proto_data->evdev, ABS_MT_POSITION_Y, &priv->miny,
                       &priv->maxy, &priv->synpara.hyst_y, &priv->resy);
+
+        if (priv->minx == priv->maxx || priv->miny == priv->maxy) {
+            xf86IDrvMsg(pInfo, X_ERROR, "Kernel bug: min == max on ABS_MT_POSITION_X/Y\n");
+            return;
+        }
 
         proto_data->st_to_mt_offset[0] = priv->minx - st_minx;
         proto_data->st_to_mt_scale[0] =
@@ -499,58 +553,35 @@ SynapticsReadEvent(InputInfoPtr pInfo, struct input_event *ev)
     SynapticsPrivate *priv = (SynapticsPrivate *) pInfo->private;
     struct eventcomm_proto_data *proto_data = priv->proto_data;
     int rc;
-    int have_events = TRUE;
     static struct timeval last_event_time;
 
-    /* empty mtdev queue first */
-    if (proto_data->mtdev && !mtdev_empty(proto_data->mtdev)) {
-        mtdev_get_event(proto_data->mtdev, ev);
-        return TRUE;
-    }
-
-    do {
-        rc = libevdev_next_event(proto_data->evdev, proto_data->read_flag, ev);
-        if (rc < 0) {
-            if (rc != -EAGAIN) {
-                LogMessageVerbSigSafe(X_ERROR, 0, "%s: Read error %d\n", pInfo->name,
-                        errno);
-            } else if (proto_data->read_flag == LIBEVDEV_READ_FLAG_SYNC)
-                proto_data->read_flag = LIBEVDEV_READ_FLAG_NORMAL;
-            have_events = FALSE;
-        } else {
-            have_events = TRUE;
-
-            /* SYN_DROPPED received in normal mode. Create a normal EV_SYN
-               so we process what's in the queue atm, then ensure we sync
-               next time */
-            if (rc == LIBEVDEV_READ_STATUS_SYNC &&
-                proto_data->read_flag == LIBEVDEV_READ_FLAG_NORMAL) {
-                proto_data->read_flag = LIBEVDEV_READ_FLAG_SYNC;
-                ev->type = EV_SYN;
-                ev->code = SYN_DROPPED;
-                ev->value = 0;
-                ev->time = last_event_time;
-            } else if (ev->type == EV_SYN)
-                last_event_time = ev->time;
-
-            /* feed mtdev. nomnomnomnom */
-            if (proto_data->mtdev)
-                mtdev_put_event(proto_data->mtdev, ev);
+    rc = libevdev_next_event(proto_data->evdev, proto_data->read_flag, ev);
+    if (rc < 0) {
+        if (rc != -EAGAIN) {
+            LogMessageVerbSigSafe(X_ERROR, 0, "%s: Read error %d\n", pInfo->name,
+                    errno);
+        } else if (proto_data->read_flag == LIBEVDEV_READ_FLAG_SYNC) {
+            proto_data->read_flag = LIBEVDEV_READ_FLAG_NORMAL;
+            return SynapticsReadEvent(pInfo, ev);
         }
-    } while (have_events && proto_data->mtdev && mtdev_empty(proto_data->mtdev));
 
-    /* loop exits if:
-       - we don't have mtdev, ev is valid, rc is TRUE, let's return it
-       - we have mtdev and it has events for us, get those
-       - we don't have a new event and mtdev doesn't have events either.
-     */
-    if (have_events && proto_data->mtdev) {
-        have_events = !mtdev_empty(proto_data->mtdev);
-        if (have_events)
-            mtdev_get_event(proto_data->mtdev, ev);
+        return FALSE;
     }
 
-    return have_events;
+    /* SYN_DROPPED received in normal mode. Create a normal EV_SYN
+       so we process what's in the queue atm, then ensure we sync
+       next time */
+    if (rc == LIBEVDEV_READ_STATUS_SYNC &&
+        proto_data->read_flag == LIBEVDEV_READ_FLAG_NORMAL) {
+        proto_data->read_flag = LIBEVDEV_READ_FLAG_SYNC;
+        ev->type = EV_SYN;
+        ev->code = SYN_REPORT;
+        ev->value = 0;
+        ev->time = last_event_time;
+    } else if (ev->type == EV_SYN)
+        last_event_time = ev->time;
+
+    return TRUE;
 }
 
 static Bool
@@ -579,7 +610,7 @@ EventProcessTouchEvent(InputInfoPtr pInfo, struct SynapticsHwState *hw,
         proto_data->cur_slot = ev->value;
     }
     else {
-        int slot_index = last_mt_vals_slot(priv);
+        int slot_index = proto_data->cur_slot;
 
         if (slot_index < 0)
             return;
@@ -664,13 +695,18 @@ EventReadHwState(InputInfoPtr pInfo,
     SynapticsPrivate *priv = (SynapticsPrivate *) pInfo->private;
     SynapticsParameters *para = &priv->synpara;
     struct eventcomm_proto_data *proto_data = priv->proto_data;
+    Bool sync_cumulative = FALSE;
+
+    set_libevdev_log_handler();
 
     SynapticsResetTouchHwState(hw, FALSE);
 
-    /* Reset cumulative values if buttons were not previously pressed */
-    if (!hw->left && !hw->right && !hw->middle) {
+    /* Reset cumulative values if buttons were not previously pressed,
+     * or no finger was previously present. */
+    if ((!hw->left && !hw->right && !hw->middle) || hw->z < para->finger_low) {
         hw->cumulative_dx = hw->x;
         hw->cumulative_dy = hw->y;
+        sync_cumulative = TRUE;
     }
 
     while (SynapticsReadEvent(pInfo, &ev)) {
@@ -679,7 +715,10 @@ EventReadHwState(InputInfoPtr pInfo,
             switch (ev.code) {
             case SYN_REPORT:
                 hw->numFingers = count_fingers(pInfo, comm);
-                hw->millis = 1000 * ev.time.tv_sec + ev.time.tv_usec / 1000;
+                if (proto_data->have_monotonic_clock)
+                    hw->millis = 1000 * ev.time.tv_sec + ev.time.tv_usec / 1000;
+                else
+                    hw->millis = GetTimeInMillis();
                 SynapticsCopyHwState(hwRet, hw);
                 return TRUE;
             }
@@ -752,9 +791,13 @@ EventReadHwState(InputInfoPtr pInfo,
                 switch (ev.code) {
                 case ABS_X:
                     hw->x = apply_st_scaling(proto_data, ev.value, 0);
+                    if (sync_cumulative)
+                        hw->cumulative_dx = hw->x;
                     break;
                 case ABS_Y:
                     hw->y = apply_st_scaling(proto_data, ev.value, 1);
+                    if (sync_cumulative)
+                        hw->cumulative_dy = hw->y;
                     break;
                 case ABS_PRESSURE:
                     hw->z = ev.value;
@@ -785,53 +828,53 @@ event_query_touch(InputInfoPtr pInfo)
     SynapticsPrivate *priv = (SynapticsPrivate *) pInfo->private;
     SynapticsParameters *para = &priv->synpara;
     struct eventcomm_proto_data *proto_data = priv->proto_data;
-    struct mtdev *mtdev;
-    int i;
+    struct libevdev *dev = proto_data->evdev;
+    int axis;
 
     priv->max_touches = 0;
     priv->num_mt_axes = 0;
 
 #ifdef EVIOCGPROP
-    if (libevdev_has_property(proto_data->evdev, INPUT_PROP_SEMI_MT)) {
+    if (libevdev_has_property(dev, INPUT_PROP_SEMI_MT)) {
         xf86IDrvMsg(pInfo, X_INFO,
                     "ignoring touch events for semi-multitouch device\n");
         priv->has_semi_mt = TRUE;
     }
 
-    if (libevdev_has_property(proto_data->evdev, INPUT_PROP_BUTTONPAD)) {
+    if (libevdev_has_property(dev, INPUT_PROP_BUTTONPAD)) {
         xf86IDrvMsg(pInfo, X_INFO, "found clickpad property\n");
         para->clickpad = TRUE;
     }
+
+    if (libevdev_has_property(dev, INPUT_PROP_TOPBUTTONPAD)) {
+        xf86IDrvMsg(pInfo, X_INFO, "found top buttonpad property\n");
+        para->has_secondary_buttons = TRUE;
+    }
 #endif
 
-    mtdev = mtdev_new_open(pInfo->fd);
-    if (!mtdev) {
-        xf86IDrvMsg(pInfo, X_WARNING,
-                    "failed to open mtdev when querying touch capabilities\n");
-        return;
-    }
 
-    for (i = 0; i < MT_ABS_SIZE; i++) {
-        if (mtdev->caps.has_abs[i]) {
-            switch (i) {
-                /* X and Y axis info is handed by synaptics already */
-            case ABS_MT_POSITION_X - ABS_MT_TOUCH_MAJOR:
-            case ABS_MT_POSITION_Y - ABS_MT_TOUCH_MAJOR:
-                /* Skip tracking ID info */
-            case ABS_MT_TRACKING_ID - ABS_MT_TOUCH_MAJOR:
-                break;
-            default:
-                priv->num_mt_axes++;
-                break;
-            }
+    if (libevdev_has_event_code(dev, EV_ABS, ABS_MT_SLOT)) {
+        for (axis = ABS_MT_SLOT + 1; axis <= ABS_MT_MAX; axis++) {
+            if (!libevdev_has_event_code(dev, EV_ABS, axis))
+                continue;
+
             priv->has_touch = TRUE;
+
+            /* X and Y axis info is handled by synaptics already and we don't
+               expose the tracking ID */
+            if (axis == ABS_MT_POSITION_X ||
+                axis == ABS_MT_POSITION_Y ||
+                axis == ABS_MT_TRACKING_ID)
+                continue;
+
+            priv->num_mt_axes++;
         }
     }
 
     if (priv->has_touch) {
         int axnum;
 
-        static const char *labels[] = {
+        static const char *labels[ABS_MT_MAX] = {
             AXIS_LABEL_PROP_ABS_MT_TOUCH_MAJOR,
             AXIS_LABEL_PROP_ABS_MT_TOUCH_MINOR,
             AXIS_LABEL_PROP_ABS_MT_WIDTH_MAJOR,
@@ -843,55 +886,60 @@ event_query_touch(InputInfoPtr pInfo)
             AXIS_LABEL_PROP_ABS_MT_BLOB_ID,
             AXIS_LABEL_PROP_ABS_MT_TRACKING_ID,
             AXIS_LABEL_PROP_ABS_MT_PRESSURE,
+            AXIS_LABEL_PROP_ABS_MT_DISTANCE,
+            AXIS_LABEL_PROP_ABS_MT_TOOL_X,
+            AXIS_LABEL_PROP_ABS_MT_TOOL_Y,
         };
 
-        if (mtdev->caps.slot.maximum > 0)
-            priv->max_touches = mtdev->caps.slot.maximum -
-                mtdev->caps.slot.minimum + 1;
-
+        priv->max_touches = libevdev_get_num_slots(dev);
         priv->touch_axes = malloc(priv->num_mt_axes *
                                   sizeof(SynapticsTouchAxisRec));
         if (!priv->touch_axes) {
             priv->has_touch = FALSE;
-            goto out;
+            return;
         }
 
         axnum = 0;
-        for (i = 0; i < MT_ABS_SIZE; i++) {
-            if (mtdev->caps.has_abs[i]) {
-                switch (i) {
-                    /* X and Y axis info is handed by synaptics already, we just
-                     * need to map the evdev codes to the valuator numbers */
-                case ABS_MT_POSITION_X - ABS_MT_TOUCH_MAJOR:
-                    proto_data->axis_map[i] = 0;
+        for (axis = ABS_MT_SLOT + 1; axis <= ABS_MT_MAX; axis++) {
+            int axis_idx = axis - ABS_MT_TOUCH_MAJOR;
+
+            if (!libevdev_has_event_code(dev, EV_ABS, axis))
+                continue;
+
+            switch (axis) {
+                /* X and Y axis info is handled by synaptics already, we just
+                 * need to map the evdev codes to the valuator numbers */
+                case ABS_MT_POSITION_X:
+                    proto_data->axis_map[axis_idx] = 0;
                     break;
 
-                case ABS_MT_POSITION_Y - ABS_MT_TOUCH_MAJOR:
-                    proto_data->axis_map[i] = 1;
+                case ABS_MT_POSITION_Y:
+                    proto_data->axis_map[axis_idx] = 1;
                     break;
 
                     /* Skip tracking ID info */
-                case ABS_MT_TRACKING_ID - ABS_MT_TOUCH_MAJOR:
+                case ABS_MT_TRACKING_ID:
                     break;
 
                 default:
-                    priv->touch_axes[axnum].label = labels[i];
-                    priv->touch_axes[axnum].min = mtdev->caps.abs[i].minimum;
-                    priv->touch_axes[axnum].max = mtdev->caps.abs[i].maximum;
+                    if (axis_idx >= sizeof(labels)/sizeof(labels[0])) {
+                        xf86IDrvMsg(pInfo, X_ERROR,
+                                    "Axis %d out of label range. This is a bug\n",
+                                    axis);
+                        priv->touch_axes[axnum].label = NULL;
+                    } else
+                        priv->touch_axes[axnum].label = labels[axis_idx];
+                    priv->touch_axes[axnum].min = libevdev_get_abs_minimum(dev, axis);
+                    priv->touch_axes[axnum].max = libevdev_get_abs_maximum(dev, axis);
                     /* Kernel provides units/mm, X wants units/m */
-                    priv->touch_axes[axnum].res =
-                        mtdev->caps.abs[i].resolution * 1000;
+                    priv->touch_axes[axnum].res = libevdev_get_abs_resolution(dev, axis) * 1000;
                     /* Valuators 0-3 are used for X, Y, and scrolling */
-                    proto_data->axis_map[i] = 4 + axnum;
+                    proto_data->axis_map[axis_idx] = 4 + axnum;
                     axnum++;
                     break;
-                }
             }
         }
     }
-
- out:
-    mtdev_close_delete(mtdev);
 }
 
 /**
@@ -907,7 +955,7 @@ EventReadDevDimensions(InputInfoPtr pInfo)
     proto_data = EventProtoDataAlloc(pInfo->fd);
     priv->proto_data = proto_data;
 
-    for (i = 0; i < MT_ABS_SIZE; i++)
+    for (i = 0; i < ABS_MT_CNT; i++)
         proto_data->axis_map[i] = -1;
     proto_data->cur_slot = -1;
 
@@ -934,7 +982,11 @@ EventAutoDevProbe(InputInfoPtr pInfo, const char *device)
     if (device) {
         int fd = -1;
 
-        SYSCALL(fd = open(device, O_RDONLY));
+        if (pInfo->flags & XI86_SERVER_FD)
+            fd = pInfo->fd;
+        else
+            SYSCALL(fd = open(device, O_RDONLY));
+
         if (fd >= 0) {
             int rc;
             struct libevdev *evdev;
@@ -945,7 +997,9 @@ EventAutoDevProbe(InputInfoPtr pInfo, const char *device)
                 libevdev_free(evdev);
             }
 
-            SYSCALL(close(fd));
+            if (!(pInfo->flags & XI86_SERVER_FD))
+                SYSCALL(close(fd));
+
             /* if a device is set and not a touchpad (or already grabbed),
              * we must return FALSE.  Otherwise, we'll add a device that
              * wasn't requested for and repeat
